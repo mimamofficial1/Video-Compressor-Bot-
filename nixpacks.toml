@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["ffmpeg"]
+nixPkgs = ["ffmpeg", "wget", "which"]
 
 [start]
-cmd = "python bot.py"
+cmd = "bash start.sh"

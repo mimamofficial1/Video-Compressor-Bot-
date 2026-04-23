@@ -1,16 +1,17 @@
-# config.py
+import os
+from dotenv import load_dotenv
 
-BOT_TOKENS = [
-    "8153208191:AAET_YAHGjeLFNXf0q1Wy1zWVoGNwcyMnlY",
-    "8153208191:AAET_YAHGjeLFNXf0q1Wy1zWVoGNwcyMnlY"
-]
-MONGO_URI= "mongodb+srv://trumbot:trumbot@cluster0.cfkaeno.mongodb.net/?retryWrites=true&w=majority"
-API_ID = 23631217
-API_HASH = "567c6df308dc6901790309499f729d12"
-DB_NAME = "filestream2025"
-DOMAIN = "http://localhost:8000"
-SECRET_KEY = "your_super_secret"
-BIN_CHANNEL = -1002338765286
-IMG_API_KEY = "1c4e80d4ddc00be455d537ef0fc18d4a"
-OWNER_ID = 6139759254
-ALLOWED_USER_IDS = [6139759254] 
+load_dotenv()
+
+class Config:
+    # ─── Telegram ───────────────────────────────
+    API_ID       = int(os.environ.get("API_ID", 0))
+    API_HASH     = os.environ.get("API_HASH", "")
+    BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
+
+    # ─── Limits ─────────────────────────────────
+    MAX_FILE_SIZE    = int(os.environ.get("MAX_FILE_SIZE", 2_000_000_000))  # 2 GB
+    FFMPEG_TIMEOUT   = int(os.environ.get("FFMPEG_TIMEOUT", 1800))           # 30 min
+
+    # ─── Database ───────────────────────────────
+    DB_PATH = os.environ.get("DB_PATH", "bot_data.db")

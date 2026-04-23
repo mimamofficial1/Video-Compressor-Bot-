@@ -1,248 +1,509 @@
-import asyncio
-from contextlib import asynccontextmanager
-import mimetypes
-import math
-import logging
-from os import environ
-import random
+import os
 import time
-from collections import OrderedDict
+import asyncio
+import subprocess
+from pyrogram import Client, filters
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.errors import FloodWait
+from config import Config
+from database import Database
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
-from telethon.sessions import StringSession
-from telethon import TelegramClient
-from telethon.errors import FloodWaitError
-from telethon.tl.functions.upload import GetFileRequest
-from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
-from telethon.tl.types import InputDocumentFileLocation, DocumentAttributeFilename
+app = Client(
+    "VideoCompressorBot",
+    api_id=Config.API_ID,
+    api_hash=Config.API_HASH,
+    bot_token=Config.BOT_TOKEN,
+)
 
-from config import API_ID, API_HASH, BIN_CHANNEL, SESSION_STRING, BOT_TOKENS  # <-- multiple tokens in list
-from crypto import decrypt_msg_id
+db = Database()
 
-load_dotenv()
+# ─────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────
 
-MAX_TELEGRAM_CHUNK = 512 * 1024
-CACHE_CLEAN_INTERVAL = 30 * 60
-MAX_CONCURRENT_DOWNLOADS = 5
+def human_size(num):
+    for unit in ["B", "KB", "MB", "GB"]:
+        if num < 1024:
+            return f"{num:.2f} {unit}"
+        num /= 1024
+    return f"{num:.2f} TB"
 
-random.seed(42)
-active_ips = set()
-cached_file_ids = {}
-download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+def progress_bar(current, total):
+    pct = (current / total) * 100 if total else 0
+    filled = int(pct / 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    return f"[{bar}] {pct:.1f}%"
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+async def update_progress(msg, action, current, total, start_time):
+    elapsed = time.time() - start_time
+    speed = current / elapsed if elapsed > 0 else 0
+    eta = (total - current) / speed if speed > 0 else 0
+    text = (
+        f"**{action}**\n\n"
+        f"{progress_bar(current, total)}\n\n"
+        f"📦 **Size:** {human_size(current)} / {human_size(total)}\n"
+        f"⚡ **Speed:** {human_size(speed)}/s\n"
+        f"⏱ **ETA:** {int(eta)}s"
+    )
+    try:
+        await msg.edit_text(text)
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
 
+def settings_text(s):
+    return (
+        f"**⚙️ Your Settings**\n\n"
+        f"🎞 **Resolution:** `{s['resolution']}`\n"
+        f"🎬 **Codec:** `{s['codec']}`\n"
+        f"🔢 **Bits:** `{s['bits']}`\n"
+        f"📊 **CRF:** `{s['crf']}`\n"
+        f"📐 **Aspect Ratio:** `{s['aspect']}`\n"
+        f"📤 **Upload Mode:** `{s['upload_mode']}`\n"
+        f"💧 **Watermark:** `{s['watermark'] or 'None'}`\n"
+        f"🏷 **WM Color:** `{s['wm_color']}`\n"
+        f"📍 **WM Position:** `{s['wm_pos']}`\n"
+        f"📏 **WM Size:** `{s['wm_size']}`\n"
+        f"🔇 **Metadata:** `{s['metadata']}`\n"
+        f"✏️ **Auto Rename:** `{s['rename'] or 'None'}`\n"
+    )
 
-# === MULTI BOT CLIENTS === #
-bot_clients = []
+def settings_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎞 Resolution", callback_data="set_res"),
+         InlineKeyboardButton("🎬 Codec", callback_data="set_codec")],
+        [InlineKeyboardButton("🔢 Bits", callback_data="set_bits"),
+         InlineKeyboardButton("📊 CRF", callback_data="set_crf")],
+        [InlineKeyboardButton("📐 Aspect Ratio", callback_data="set_aspect"),
+         InlineKeyboardButton("📤 Upload Mode", callback_data="set_upload")],
+        [InlineKeyboardButton("💧 Watermark", callback_data="set_wm"),
+         InlineKeyboardButton("🔇 Metadata", callback_data="set_meta")],
+        [InlineKeyboardButton("✏️ Auto Rename", callback_data="set_rename")],
+        [InlineKeyboardButton("🔄 Reset All", callback_data="reset_settings"),
+         InlineKeyboardButton("❌ Close", callback_data="close")],
+    ])
 
-async def init_bot_clients():
-    for token in BOT_TOKENS:
-        client = TelegramClient(f"bot_{token[:6]}", int(API_ID), API_HASH)
-        await client.start(bot_token=token)
-        bot_clients.append(client)
-        logger.info(f"Bot client initialized for token ending with ...{token[-5:]}")
+def build_ffmpeg_cmd(input_path, output_path, s, wm_text=None):
+    vf_filters = []
 
-def get_random_client():
-    return random.choice(bot_clients)
+    # Resolution
+    res_map = {
+        "1080p": "1920:1080", "720p": "1280:720",
+        "576p": "1024:576",  "480p": "854:480",
+        "360p": "640:360",   "240p": "426:240",
+        "Original": None,
+    }
+    scale = res_map.get(s["resolution"])
+    if scale:
+        vf_filters.append(f"scale={scale}")
 
+    # Aspect ratio
+    if s["aspect"] != "None":
+        vf_filters.append(f"setdar={s['aspect'].replace(':','/')}")
 
-# === DC SESSION CACHE === #
-class DCCache:
-    def __init__(self, max_size=5, ttl=1800):
-        self.sessions = OrderedDict()
-        self.max_size = max_size
-        self.ttl = ttl
+    # Watermark
+    if wm_text and wm_text != "None":
+        pos_map = {
+            "top":    "x=(w-text_w)/2:y=10",
+            "center": "x=(w-text_w)/2:y=(h-text_h)/2",
+            "bottom": "x=(w-text_w)/2:y=h-text_h-10",
+        }
+        pos = pos_map.get(s["wm_pos"], pos_map["bottom"])
+        vf_filters.append(
+            f"drawtext=text='{wm_text}':fontsize={s['wm_size']}:"
+            f"fontcolor={s['wm_color']}:{pos}"
+        )
 
-    def _evict_expired(self):
-        now = time.time()
-        to_delete = [dc_id for dc_id, (ts, _) in self.sessions.items() if now - ts > self.ttl]
-        for dc_id in to_delete:
-            _, client = self.sessions.pop(dc_id)
-            asyncio.create_task(client.disconnect())
-            logger.info(f"Evicted expired DC {dc_id}")
+    vf = ",".join(vf_filters) if vf_filters else None
 
-    def _evict_if_needed(self):
-        while len(self.sessions) > self.max_size:
-            dc_id, (_, client) = self.sessions.popitem(last=False)
-            asyncio.create_task(client.disconnect())
-            logger.info(f"Evicted LRU DC {dc_id}")
+    codec_map = {
+        "x264": "libx264", "x265": "libx265",
+        "VP9":  "libvpx-vp9", "AV1": "libaom-av1",
+    }
+    vcodec = codec_map.get(s["codec"], "libx264")
 
-    def get(self, dc_id):
-        self._evict_expired()
-        if dc_id in self.sessions:
-            ts, client = self.sessions.pop(dc_id)
-            self.sessions[dc_id] = (time.time(), client)
-            return client
-        return None
+    pix = "yuv420p10le" if s["bits"] == "10 Bits" else "yuv420p"
 
-    def set(self, dc_id, client):
-        self.sessions[dc_id] = (time.time(), client)
-        self._evict_if_needed()
+    cmd = ["ffmpeg", "-i", input_path, "-c:v", vcodec,
+           "-crf", str(s["crf"]), "-preset", "fast",
+           "-pix_fmt", pix, "-c:a", "aac", "-b:a", "128k"]
 
-media_sessions = DCCache(max_size=5, ttl=5000)
+    if vf:
+        cmd += ["-vf", vf]
 
+    # Strip metadata
+    if s["metadata"] == "Disabled":
+        cmd += ["-map_metadata", "-1"]
 
-# === FLOODWAIT WRAPPER === #
-def floodwait_retry(func):
-    import functools
+    cmd += [output_path, "-y"]
+    return cmd
 
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        retries = 3
-        for attempt in range(retries):
-            try:
-                return await func(*args, **kwargs)
-            except FloodWaitError as e:
-                wait = e.seconds + 1
-                logger.warning(f"FloodWaitError: sleeping for {wait}s (attempt {attempt + 1})")
-                await asyncio.sleep(wait)
-            except Exception as e:
-                logger.error(f"Unhandled error in {func.__name__}: {e}")
-                raise
-        raise RuntimeError("Too many FloodWaits, aborting.")
-    return wrapper
+# ─────────────────────────────────────────────
+#  COMMANDS
+# ─────────────────────────────────────────────
 
-@floodwait_retry
-async def safe_get_messages(*args, **kwargs):
-    return await get_random_client().get_messages(*args, **kwargs)
+@app.on_message(filters.command("start") & filters.private)
+async def start_cmd(client, message: Message):
+    await message.reply_text(
+        "👋 **Hi! I'm a Video Compressor Bot**\n\n"
+        "Send me any video and I'll compress it while keeping good quality.\n\n"
+        "📌 **Commands:**\n"
+        "/settings – Configure compression\n"
+        "/help – How to use\n\n"
+        "🚫 18+ content is **not** allowed.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Settings", callback_data="open_settings"),
+             InlineKeyboardButton("❓ Help", callback_data="help")]
+        ])
+    )
 
-@floodwait_retry
-async def safe_export_auth(dc_id):
-    return await get_random_client()(ExportAuthorizationRequest(dc_id=dc_id))
+@app.on_message(filters.command("settings") & filters.private)
+async def settings_cmd(client, message: Message):
+    s = db.get_settings(message.from_user.id)
+    await message.reply_text(
+        settings_text(s),
+        reply_markup=settings_keyboard()
+    )
 
-@floodwait_retry
-async def safe_import_auth(dc_client, auth):
-    return await dc_client(ImportAuthorizationRequest(id=auth.id, bytes=auth.bytes))
+@app.on_message(filters.command("help") & filters.private)
+async def help_cmd(client, message: Message):
+    await message.reply_text(
+        "**📖 How to use:**\n\n"
+        "1️⃣ Send a video file (MP4, MKV, AVI, MOV)\n"
+        "2️⃣ Bot will auto-compress with your settings\n"
+        "3️⃣ Receive compressed file!\n\n"
+        "**Tips:**\n"
+        "• Lower CRF = better quality but bigger file\n"
+        "• x265 gives smaller files than x264\n"
+        "• Use /settings to customize everything"
+    )
 
+# ─────────────────────────────────────────────
+#  VIDEO HANDLER
+# ─────────────────────────────────────────────
 
-# === FASTAPI APP === #
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    logger.info("Starting bot pool...")
-    await init_bot_clients()
-    asyncio.create_task(clean_cache())
-    yield
-    logger.info("Shutting down all clients...")
-    for client in bot_clients:
-        await client.disconnect()
-    for _, dc_client in media_sessions.sessions.values():
-        try:
-            await dc_client.disconnect()
-        except Exception:
-            pass
+@app.on_message((filters.video | filters.document) & filters.private)
+async def handle_video(client, message: Message):
+    file = message.video or message.document
+    if not file:
+        return
 
-app = FastAPI(lifespan=lifespan)
+    # Check if it's a video document
+    if message.document and not message.document.mime_type.startswith("video/"):
+        await message.reply_text("⚠️ Please send a valid video file.")
+        return
 
+    if file.file_size > Config.MAX_FILE_SIZE:
+        await message.reply_text(
+            f"❌ File too large! Max size: {human_size(Config.MAX_FILE_SIZE)}"
+        )
+        return
 
-async def clean_cache():
-    while True:
-        await asyncio.sleep(CACHE_CLEAN_INTERVAL)
-        cached_file_ids.clear()
-        logger.debug("Cleaned file ID cache")
+    s = db.get_settings(message.from_user.id)
+    status_msg = await message.reply_text("⏬ **Downloading your video...**")
 
+    # Download
+    start = time.time()
+    dl_path = None
 
-async def get_media_session(dc_id):
-    client = media_sessions.get(dc_id)
-    if client and await client.is_connected():
-        return client
-
-    logger.info(f"Creating new client for DC {dc_id}")
-    session_name = f"client_dc_{dc_id}"
-    client = TelegramClient(session_name, int(API_ID), API_HASH)
-    await client.connect()
-
-    if not await client.is_user_authorized():
-        exported = await safe_export_auth(dc_id)
-        await safe_import_auth(client, exported)
-
-    media_sessions.set(dc_id, client)
-    return client
-
-
-@app.get("/stream/{msg_id}")
-async def stream_handler(msg_id: str, request: Request):
-    ip = request.client.host
-    if ip in active_ips:
-        raise HTTPException(status_code=429, detail="Download already in progress for this IP")
-    active_ips.add(ip)
+    async def dl_progress(current, total):
+        await update_progress(status_msg, "⏬ Downloading", current, total, start)
 
     try:
-        async with download_semaphore:
-            msg_id = decrypt_msg_id(msg_id)
-
-            if msg_id in cached_file_ids:
-                message = cached_file_ids[msg_id]
-            else:
-                message = await safe_get_messages(int(BIN_CHANNEL), ids=msg_id)
-                if message:
-                    cached_file_ids[msg_id] = message
-
-            if not message or not message.document:
-                raise HTTPException(status_code=404, detail="Invalid or non-document message")
-
-            doc = message.document
-            file_size = doc.size
-            filename = next(
-                (attr.file_name for attr in doc.attributes if isinstance(attr, DocumentAttributeFilename)),
-                "file"
-            )
-            mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-            disposition = "inline" if "video/" in mime_type or "audio/" in mime_type else "attachment"
-
-            range_header = request.headers.get("range")
-            start = 0
-            end = file_size - 1
-
-            if range_header:
-                try:
-                    units, range_spec = range_header.strip().split("=")
-                    range_start, range_end = range_spec.split("-")
-                    start = int(range_start)
-                    if range_end:
-                        end = int(range_end)
-                except:
-                    raise HTTPException(status_code=416, detail="Invalid Range header")
-
-            length = end - start + 1
-            status_code = 206 if range_header else 200
-
-            async def iter_file():
-                limit = MAX_TELEGRAM_CHUNK
-                offset = start - (start % limit)
-                first_cut = start - offset
-                last_cut = end % limit + 1
-                first_part = math.floor(offset / limit)
-                last_part = math.ceil(end / limit)
-                parts = last_part - first_part
-                current = 1
-                try:
-                    async for chunk in get_random_client().iter_download(message, offset=offset, limit=parts, chunk_size=limit, file_size=file_size):
-                        if current == 1:
-                            yield chunk[first_cut:]
-                        elif current == parts:
-                            yield chunk[:last_cut]
-                        else:
-                            yield chunk
-                        current += 1
-                finally:
-                    active_ips.remove(ip)
-
-            headers = {
-                "Content-Type": mime_type,
-                "Content-Disposition": f'{disposition}; filename="{filename}"',
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(length)
-            }
-            if range_header:
-                headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-
-            return StreamingResponse(iter_file(), headers=headers, status_code=status_code)
-
+        dl_path = await message.download(progress=dl_progress)
     except Exception as e:
-        logger.error(f"Streaming error for IP {ip}: {e}")
-        active_ips.discard(ip)
-        raise e
+        await status_msg.edit_text(f"❌ Download failed: {e}")
+        return
+
+    orig_size = os.path.getsize(dl_path)
+    ext = ".mp4" if s["codec"] in ["x264", "x265"] else ".mkv"
+    out_name = s["rename"] if s["rename"] else os.path.splitext(os.path.basename(dl_path))[0]
+    out_path = f"downloads/{message.from_user.id}_{out_name}_compressed{ext}"
+    os.makedirs("downloads", exist_ok=True)
+
+    # Compress
+    await status_msg.edit_text(
+        f"🔄 **Compressing...**\n\n"
+        f"📁 File: `{os.path.basename(dl_path)}`\n"
+        f"⚙️ Settings: `{s['resolution']} | {s['codec']} | CRF {s['crf']}`"
+    )
+
+    cmd = build_ffmpeg_cmd(dl_path, out_path, s, s.get("watermark"))
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=Config.FFMPEG_TIMEOUT)
+        if proc.returncode != 0:
+            err = proc.stderr.decode()[-500:]
+            await status_msg.edit_text(f"❌ **FFmpeg error:**\n```{err}```")
+            return
+    except subprocess.TimeoutExpired:
+        await status_msg.edit_text("❌ Compression timed out (file too large or slow server).")
+        return
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {e}")
+        return
+
+    comp_size = os.path.getsize(out_path)
+    saved_pct = ((orig_size - comp_size) / orig_size * 100) if orig_size > 0 else 0
+
+    caption = (
+        f"✅ **Compression Done!**\n\n"
+        f"📦 Original: `{human_size(orig_size)}`\n"
+        f"📦 Compressed: `{human_size(comp_size)}`\n"
+        f"💾 Saved: `{saved_pct:.1f}%`\n\n"
+        f"⚙️ `{s['resolution']} | {s['codec']} | CRF {s['crf']}`"
+    )
+
+    # Upload
+    ul_start = time.time()
+    await status_msg.edit_text("📤 **Uploading compressed video...**")
+
+    async def ul_progress(current, total):
+        await update_progress(status_msg, "📤 Uploading", current, total, ul_start)
+
+    try:
+        if s["upload_mode"] == "Document":
+            await message.reply_document(
+                out_path, caption=caption, progress=ul_progress
+            )
+        else:
+            await message.reply_video(
+                out_path, caption=caption, progress=ul_progress
+            )
+        await status_msg.delete()
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Upload failed: {e}")
+    finally:
+        for f in [dl_path, out_path]:
+            try:
+                if f and os.path.exists(f):
+                    os.remove(f)
+            except:
+                pass
+
+# ─────────────────────────────────────────────
+#  CALLBACK HANDLERS
+# ─────────────────────────────────────────────
+
+@app.on_callback_query()
+async def cb_handler(client, cb: CallbackQuery):
+    uid = cb.from_user.id
+    data = cb.data
+
+    if data == "open_settings":
+        s = db.get_settings(uid)
+        await cb.message.edit_text(settings_text(s), reply_markup=settings_keyboard())
+        return
+
+    if data == "help":
+        await cb.answer(
+            "Send a video file and I'll compress it with your settings!",
+            show_alert=True
+        )
+        return
+
+    if data == "close":
+        await cb.message.delete()
+        return
+
+    if data == "reset_settings":
+        db.reset_settings(uid)
+        s = db.get_settings(uid)
+        await cb.message.edit_text(settings_text(s), reply_markup=settings_keyboard())
+        await cb.answer("✅ Settings reset to default!")
+        return
+
+    # Resolution
+    if data == "set_res":
+        await cb.message.edit_reply_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("1080p", callback_data="res_1080p"),
+             InlineKeyboardButton("720p",  callback_data="res_720p"),
+             InlineKeyboardButton("576p",  callback_data="res_576p")],
+            [InlineKeyboardButton("480p",  callback_data="res_480p"),
+             InlineKeyboardButton("360p",  callback_data="res_360p"),
+             InlineKeyboardButton("240p",  callback_data="res_240p")],
+            [InlineKeyboardButton("Original", callback_data="res_Original")],
+            [InlineKeyboardButton("« Back", callback_data="open_settings")],
+        ]))
+        return
+
+    if data.startswith("res_"):
+        db.update_setting(uid, "resolution", data[4:])
+        s = db.get_settings(uid)
+        await cb.message.edit_text(settings_text(s), reply_markup=settings_keyboard())
+        await cb.answer(f"✅ Resolution set to {data[4:]}")
+        return
+
+    # Codec
+    if data == "set_codec":
+        await cb.message.edit_reply_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("x264 (fast)", callback_data="codec_x264"),
+             InlineKeyboardButton("x265 (smaller)", callback_data="codec_x265")],
+            [InlineKeyboardButton("VP9", callback_data="codec_VP9"),
+             InlineKeyboardButton("AV1 (slowest)", callback_data="codec_AV1")],
+            [InlineKeyboardButton("« Back", callback_data="open_settings")],
+        ]))
+        return
+
+    if data.startswith("codec_"):
+        db.update_setting(uid, "codec", data[6:])
+        s = db.get_settings(uid)
+        await cb.message.edit_text(settings_text(s), reply_markup=settings_keyboard())
+        await cb.answer(f"✅ Codec set to {data[6:]}")
+        return
+
+    # Bits
+    if data == "set_bits":
+        await cb.message.edit_reply_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("8 Bits", callback_data="bits_8 Bits"),
+             InlineKeyboardButton("10 Bits", callback_data="bits_10 Bits")],
+            [InlineKeyboardButton("« Back", callback_data="open_settings")],
+        ]))
+        return
+
+    if data.startswith("bits_"):
+        db.update_setting(uid, "bits", data[5:])
+        s = db.get_settings(uid)
+        await cb.message.edit_text(settings_text(s), reply_markup=settings_keyboard())
+        await cb.answer(f"✅ Bits set to {data[5:]}")
+        return
+
+    # CRF
+    if data == "set_crf":
+        await cb.message.edit_reply_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("18 (Best)", callback_data="crf_18"),
+             InlineKeyboardButton("23", callback_data="crf_23"),
+             InlineKeyboardButton("28", callback_data="crf_28")],
+            [InlineKeyboardButton("30 (Default)", callback_data="crf_30"),
+             InlineKeyboardButton("35", callback_data="crf_35"),
+             InlineKeyboardButton("40", callback_data="crf_40")],
+            [InlineKeyboardButton("45", callback_data="crf_45"),
+             InlineKeyboardButton("51 (Smallest)", callback_data="crf_51")],
+            [InlineKeyboardButton("« Back", callback_data="open_settings")],
+        ]))
+        return
+
+    if data.startswith("crf_"):
+        db.update_setting(uid, "crf", int(data[4:]))
+        s = db.get_settings(uid)
+        await cb.message.edit_text(settings_text(s), reply_markup=settings_keyboard())
+        await cb.answer(f"✅ CRF set to {data[4:]}")
+        return
+
+    # Aspect Ratio
+    if data == "set_aspect":
+        await cb.message.edit_reply_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("16:9", callback_data="aspect_16:9"),
+             InlineKeyboardButton("4:3",  callback_data="aspect_4:3"),
+             InlineKeyboardButton("1:1",  callback_data="aspect_1:1")],
+            [InlineKeyboardButton("None (Keep Original)", callback_data="aspect_None")],
+            [InlineKeyboardButton("« Back", callback_data="open_settings")],
+        ]))
+        return
+
+    if data.startswith("aspect_"):
+        db.update_setting(uid, "aspect", data[7:])
+        s = db.get_settings(uid)
+        await cb.message.edit_text(settings_text(s), reply_markup=settings_keyboard())
+        await cb.answer(f"✅ Aspect ratio set to {data[7:]}")
+        return
+
+    # Upload Mode
+    if data == "set_upload":
+        await cb.message.edit_reply_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("📄 Document", callback_data="upload_Document"),
+             InlineKeyboardButton("🎬 Video", callback_data="upload_Video")],
+            [InlineKeyboardButton("« Back", callback_data="open_settings")],
+        ]))
+        return
+
+    if data.startswith("upload_"):
+        db.update_setting(uid, "upload_mode", data[7:])
+        s = db.get_settings(uid)
+        await cb.message.edit_text(settings_text(s), reply_markup=settings_keyboard())
+        await cb.answer(f"✅ Upload mode set to {data[7:]}")
+        return
+
+    # Watermark
+    if data == "set_wm":
+        await cb.message.reply_text(
+            "💧 **Set Watermark**\n\nSend your watermark text as a reply to this message.\n"
+            "Send `none` to remove watermark."
+        )
+        return
+
+    # Metadata
+    if data == "set_meta":
+        await cb.message.edit_reply_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Keep Metadata", callback_data="meta_Enabled"),
+             InlineKeyboardButton("❌ Remove Metadata", callback_data="meta_Disabled")],
+            [InlineKeyboardButton("« Back", callback_data="open_settings")],
+        ]))
+        return
+
+    if data.startswith("meta_"):
+        db.update_setting(uid, "metadata", data[5:])
+        s = db.get_settings(uid)
+        await cb.message.edit_text(settings_text(s), reply_markup=settings_keyboard())
+        await cb.answer(f"✅ Metadata set to {data[5:]}")
+        return
+
+    # Auto Rename
+    if data == "set_rename":
+        await cb.message.reply_text(
+            "✏️ **Set Auto Rename**\n\nReply with the filename prefix.\n"
+            "Send `none` to disable auto rename.\n\n"
+            "Example: `MyVideo` → output will be `MyVideo_compressed.mp4`"
+        )
+        return
+
+    await cb.answer()
+
+# ─────────────────────────────────────────────
+#  WATERMARK & RENAME TEXT INPUT
+# ─────────────────────────────────────────────
+
+@app.on_message(filters.text & filters.private & ~filters.command(["start","help","settings"]))
+async def text_handler(client, message: Message):
+    uid = message.from_user.id
+    text = message.text.strip()
+
+    # Simple keyword detection for watermark/rename setting flows
+    # (In production, use conversation states / FSM)
+    lower = text.lower()
+    if lower == "none":
+        db.update_setting(uid, "watermark", None)
+        db.update_setting(uid, "rename", None)
+        await message.reply_text("✅ Cleared!")
+        return
+
+    # Heuristic: short text could be rename or watermark
+    await message.reply_text(
+        f"❓ Did you want to set:\n\n"
+        f"1️⃣ **Watermark** text → `{text}`\n"
+        f"2️⃣ **Auto Rename** → `{text}`",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💧 Set as Watermark", callback_data=f"setwm_{text[:30]}")],
+            [InlineKeyboardButton("✏️ Set as Auto Rename", callback_data=f"setrename_{text[:30]}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="close")],
+        ])
+    )
+
+@app.on_callback_query(filters.regex("^setwm_"))
+async def setwm_cb(client, cb: CallbackQuery):
+    val = cb.data[6:]
+    db.update_setting(cb.from_user.id, "watermark", val)
+    await cb.message.edit_text(f"✅ Watermark set to: `{val}`")
+
+@app.on_callback_query(filters.regex("^setrename_"))
+async def setrename_cb(client, cb: CallbackQuery):
+    val = cb.data[10:]
+    db.update_setting(cb.from_user.id, "rename", val)
+    await cb.message.edit_text(f"✅ Auto rename set to: `{val}`")
+
+# ─────────────────────────────────────────────
+#  RUN
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("🤖 Bot starting...")
+    os.makedirs("downloads", exist_ok=True)
+    app.run()
